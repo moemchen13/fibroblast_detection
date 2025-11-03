@@ -16,7 +16,7 @@ class ImageFibroblast:
         self.filename = file_path.name
         self.name = self.filename.split(".")[0]
         self.sobel_threshold = sobel_threshold
-        self.original_image = cv2.imread(file_path)
+        self.original_image = cv2.imread(file_path,cv2.IMREAD_GRAYSCALE)
         self.image = self.original_image
         self.cell = None
         self.multiple_cells_possible = multiple_cells_possible
@@ -46,6 +46,7 @@ class ImageFibroblast:
     @staticmethod
     def remove_with_polyfit(bg, mask, degree=2, add_noise=True, rng=None):
         #Polynomialfit for background
+        #print(bg.shape)
         H, W = bg.shape
         yy, xx = np.mgrid[0:H, 0:W]
         X = np.column_stack([xx[~mask].ravel(), yy[~mask].ravel()])
@@ -70,9 +71,8 @@ class ImageFibroblast:
             out[mask] += rng.normal(0, sigma, size=mask.sum())
         return out
     
-    
     @staticmethod
-    def create_cleaned_mask(self,mask):
+    def create_cleaned_mask(mask):
         cleaned_mask = remove_small_objects(mask,min_size=100,connectivity=2)
         filled = binary_fill_holes(cleaned_mask).astype(np.uint8)
         # Optionally, dilate slightly to include nearby pixels
@@ -82,22 +82,22 @@ class ImageFibroblast:
 
 
     def impute_values(self):
-        mask = self.kmeans==0
+        mask = self.kmeans_labels==0
         cleaned_mask = self.create_cleaned_mask(mask)
-        self.image = self.remove_with_polyfit(self.original_image,cleaned_mask,rng=13)
-        
+        self.image = self.remove_with_polyfit(self.original_image,cleaned_mask,rng=np.random.default_rng(13))
+
 
     def preprocess_images(self):
         self.kmeans_labels = self.kmeans(self.image)
         if self.is_interference():
             self.impute_values()
 
+
     def detect_possible_arms(self):
-        sobel_img = sobel(self.img)
+        sobel_img = sobel(self.image)
         counts,bins = np.histogram(sobel_img.ravel(),bins=300)
         mask = (sobel_img>self.sobel_threshold)
         return mask, counts,bins
-
 
 
     def fuse_cell_with_arms(self,cell_mask,possible_arms_mask):

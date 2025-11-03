@@ -27,7 +27,7 @@ def main():
     
     parser.add_argument("-o", "--output", help="output dir name", default="out")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
-    parser.add_argument("-d", "--device", help="Do you have a GPU for the SAM model", default="cpu")
+    parser.add_argument("-d", "--device", help="Do you have a GPU for the SAM model", default="cpu",choices=["cpu","cuda"])
     
     # Parse args
     args = parser.parse_args()
@@ -53,7 +53,7 @@ def main():
     if input_image is not None:
         images = fd.load_image(input_image,args.threshold_sobel)
     if in_dir is not None:
-        images = fd.load_folder_images(in_dir)
+        images = fd.load_folder_images(in_dir,args.threshold_sobel)
     verbose_print("Loaded Images")
 
 
