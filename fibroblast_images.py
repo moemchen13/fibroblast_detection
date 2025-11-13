@@ -4,99 +4,147 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage.filters import sobel
 from sklearn.cluster import MiniBatchKMeans
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import LinearRegression
-from skimage.morphology import remove_small_objects
-from scipy.ndimage import binary_fill_holes
+from skimage.morphology import remove_small_objects, convex_hull_image, remove_small_holes, opening, closing, disk
+from skimage import filters, measure
+from scipy import ndimage 
+from PIL import Image
 
 
 class ImageFibroblast:
-    def __init__(self, file_path:Path,sobel_threshold:float=0.1,multiple_cells_possible:bool=False,k:int=3):
+    def __init__(self, file_path:Path,k:int=3,
+                 sobel_cell_threshold:float=1,interference_pixel_value:int=120,
+                 disturbing_mesh:int=40000,min_regions_mash:int=4,
+                 min_mash_hole_size:int=625,min_crop_ratio:float=0.85,
+                 sobel_arms_threshold:float= 1,background_ratio:float=0.7,
+                 scale_at_bottom:bool=True,r:int=50,smooth_radius:int=5,
+                 round_radius:int=5):
         self.file_path = file_path
         self.filename = file_path.name
         self.name = self.filename.split(".")[0]
-        self.sobel_threshold = sobel_threshold
         self.original_image = cv2.imread(file_path,cv2.IMREAD_GRAYSCALE)
         self.image = self.original_image
         self.cell = None
-        self.multiple_cells_possible = multiple_cells_possible
         self.segmentation_masks = None
         self.kmeans_labels = None
         self.k=k
+        self.background_ratio=background_ratio
+        #find Cell in image params
+        self.sobel_cell_threshold=sobel_cell_threshold
+        self.interference_pixel_value=interference_pixel_value
+        self.distrubing_mesh = disturbing_mesh
+        self.min_regions_mash = min_regions_mash
+        self.min_mash_hole_size = min_mash_hole_size #bigger as than 25**2 quader
+        self.sobel_arms_threshold = sobel_arms_threshold
+        self.min_crop_ratio = min_crop_ratio
+        self.scale_at_bottom =scale_at_bottom
+        #classical cell body creation params
+        self.r = r
+        self.smooth_radius=smooth_radius
+        self.round_radius=round_radius
     
 
-    def kmeans(self,pic):
-        #first class darkest cluster last class brightest
-        pixels = pic.reshape(-1, 1)
-        kmeans = MiniBatchKMeans(n_clusters=3, batch_size=2048, max_iter=100, random_state=0)
-        labels_kmeans = kmeans.fit_predict(pixels).reshape(pic.shape)
+    def kmeans(self,image:np.ndarray=None,k:int=None):
+        if k is None:
+            k=self.k
+        if image is None:
+            image = self.original_image
+
+        channels = 1
+        if len(image.shape)>2:
+            channels = image.shape[2]
+        pixels = image.reshape(-1, channels)
+        kmeans = MiniBatchKMeans(n_clusters=k, batch_size=2048, max_iter=100, random_state=0)
+        labels_kmeans = kmeans.fit_predict(pixels).reshape(image.shape[:2])
         centers = kmeans.cluster_centers_.ravel() 
         order = np.argsort(centers)  
         mapping = np.empty_like(order)
-        mapping[order] = np.arange(3)
-
+        mapping[order] = np.arange(k*channels)
         labels_ranked = mapping[labels_kmeans]
         return labels_ranked
         
     
-    def is_interference(self,artefact_threshold=120)->int|None:
-        return (self.original_image[self.kmeans_labels==0].mean())<artefact_threshold
+    def is_interference(self)->int|None:
+        return (self.original_image[self.kmeans_labels==0].mean())<self.interference_pixel_value
         
 
     @staticmethod
-    def remove_with_polyfit(bg, mask, degree=2, add_noise=True, rng=None):
-        #Polynomialfit for background
-        #print(bg.shape)
-        H, W = bg.shape
-        yy, xx = np.mgrid[0:H, 0:W]
-        X = np.column_stack([xx[~mask].ravel(), yy[~mask].ravel()])
-        y = bg[~mask].ravel()
-
-        poly = PolynomialFeatures(degree=degree, include_bias=True)
-        Xp = poly.fit_transform(X)
-        reg = LinearRegression().fit(Xp, y)
-        X_all = np.column_stack([xx.ravel(), yy.ravel()])
-        y_pred = reg.predict(poly.transform(X_all)).reshape(H, W)
-
-        out = bg.copy().astype(float)
-        out[mask] = y_pred[mask]
-
-        if add_noise:
-            if rng is None:
-                rng = np.random.default_rng(0)
-            # estimate noise from a ring around the mask
-            from scipy.ndimage import binary_dilation
-            ring = binary_dilation(mask, iterations=3) & ~mask
-            sigma = np.std(bg[ring]) if np.any(ring) else np.std(bg[~mask])
-            out[mask] += rng.normal(0, sigma, size=mask.sum())
-        return out
+    def mash_has_enclosed_regions(mash,n_regions,cluster_size):
+        inv_mash = ~mash
+        mask,n_labels = ndimage.label(inv_mash)
+        sizes = ndimage.sum(inv_mash,mask,range(n_labels+1))
+        #check if recurring enclosed regions
+        return (sizes>cluster_size).sum()>(n_regions +1)
     
-    @staticmethod
-    def create_cleaned_mask(mask):
-        cleaned_mask = remove_small_objects(mask,min_size=100,connectivity=2)
-        filled = binary_fill_holes(cleaned_mask).astype(np.uint8)
-        # Optionally, dilate slightly to include nearby pixels
-        kernel = np.ones((3, 3), np.uint8)
-        filled_mask = cv2.dilate(filled, kernel, iterations=10)
-        return filled_mask
 
 
-    def impute_values(self):
-        mask = self.kmeans_labels==0
-        cleaned_mask = self.create_cleaned_mask(mask)
-        self.image = self.remove_with_polyfit(self.original_image,cleaned_mask,rng=np.random.default_rng(13))
+    def get_mash_from_interference(self):
+        interference = self.kmeans_labels==0
+        labeled_mask, n_labels = ndimage.label(interference)
+        sizes = ndimage.sum(interference, labeled_mask, range(n_labels + 1))
+        largest_label = np.argmax(sizes)
+        largest_component = labeled_mask == largest_label
+        if self.mash_has_enclosed_regions(largest_component,self.min_regions_mash,self.min_mash_hole_size):
+            if largest_component.sum() > self.distrubing_mesh:
+                return largest_component
+        else: 
+            return None
+        
+
+    def crop_horizontal(self,hull):
+        horizontal = hull.sum(axis=0)/hull.shape[0]
+        mask = horizontal>self.min_crop_ratio
+        left = np.argmax(~mask)
+        right = np.argmax(mask)
+        if left > 0 or right >0:
+            if left>right:
+                self.image = self.image[:,left:]
+                hull = hull[:,left:]
+            else:
+                self.image = self.image[:,:-right]
+                hull = hull[:,:-right]
+        return hull
 
 
-    def preprocess_images(self):
-        self.kmeans_labels = self.kmeans(self.image)
+    def crop_vertical(self,hull):
+        vertical = hull.sum(axis=1)/hull.shape[1]
+        mask = vertical > self.min_crop_ratio
+        top = np.argmax(~mask)
+        bottom = np.argmax(~mask[::-1])
+        if bottom > 0 or top >0:
+            if top>bottom:
+                self.image = self.image[top:,:]
+            else:
+                bottom = hull.shape[1]-bottom
+                self.image = self.image[:-bottom,:]
+
+
+    def remove_mash(self,mash):
+        #first removes as much as possible from one side then till threshold
+        convex_hull = convex_hull_image(mash)
+        H,W = convex_hull.shape
+        cropped_convex_hull = self.crop_horizontal(convex_hull)
+        self.crop_vertical(cropped_convex_hull)
+
+
+    def preprocess_image(self):
+        if self.scale_at_bottom:
+            self.original_image = self.original_image[:-24,:]
+
+        self.image = self.original_image
+        self. kmeans_labels = self.kmeans()
         if self.is_interference():
-            self.impute_values()
+            mash = self.get_mash_from_interference()
+            if mash is not None:
+                self.remove_mash(mash)
+        else:
+            self.image = self.original_image
 
 
     def detect_possible_arms(self):
         sobel_img = sobel(self.image)
         counts,bins = np.histogram(sobel_img.ravel(),bins=300)
-        mask = (sobel_img>self.sobel_threshold)
+        sobel_threshold = self.sobel_arms_threshold*sobel_img.std() + sobel_img.mean()
+        mask = (sobel_img>sobel_threshold)
         return mask, counts,bins
 
 
@@ -130,86 +178,228 @@ class ImageFibroblast:
         arms[arms < 0] = 0
         return arms
     
-    def segment_image(self,segmentation_model):
-        results = segmentation_model(self.file_path)  # image
+
+    def segment_image(self,segmentation_model,tmp_dir=Path("./tmp")):
+        #tmp_dir.mkdir(parents=True, exist_ok=True)
+        im = Image.fromarray(self.image)
+        image_path = tmp_dir/(self.name + ".jpeg")
+        im.save(image_path)
+        results = segmentation_model(image_path)  # image
         self.segmentation_masks = results[0].masks.data.cpu().numpy()
+        image_path.unlink()
         return self.segmentation_masks
     
+
+    def is_background(self, mask):
+        H,W = mask.shape
+        return mask.sum()/(H*W)> self.background_ratio
     
-    def which_is_cell_mask(self,threshold_low=130,threshold_high=0.65,tolerance_irregular_shape=0.7):
+
+    def find_point_in_cell_by_sobel(self):
+        #Finds point cell by weighted centroid in sobel image
+        sobel_image = filters.sobel(self.image)
+        #normalize image
+        sobel_image = (sobel_image-sobel_image.min())/(sobel_image.max()-sobel_image.min() +1e-12)
+        threshold = self.sobel_cell_threshold* sobel_image.std() + sobel_image.mean()
+        filtered_image = (sobel_image>=threshold)
+
+        filtered_image = remove_small_objects(filtered_image,min_size=100)
+        lab = measure.label(filtered_image)
+        props = measure.regionprops(lab,intensity_image=self.image)
+        if not props:
+            raise ValueError("No structure detected after threshold.")
+        best = max(props,key=lambda r: (r.intensity_image[r.filled_image].sum() 
+                                        if r.intensity_image is not None else r.area))
+        yc,xc = best.weighted_centroid
+        return int(yc),int(xc)
+
+
+    @staticmethod
+    def circular_struct(radius):
+        L = np.arange(-radius, radius + 1)
+        X, Y = np.meshgrid(L, L)
+        return (X**2 + Y**2) <= radius**2
+
+
+    def connect_nearby_components(self,mask, radius=3):
+        selem = self.circular_struct(radius)
+        # closing = dilation followed by erosion
+        closed = ndimage.binary_closing(mask, structure=selem)
+        return closed
+
+
+    def remove_small_and_fill(self,mask):
+        # 1. Remove thin structures
+        thin_removed = ndimage.binary_opening(mask, structure=np.ones((3, 3), bool))
+
+        # 2. Remove tiny components
+        labels = measure.label(thin_removed, connectivity=2)
+        counts = np.bincount(labels.ravel())
+        big = counts >= 20   # choose your min_size
+        big[0] = False
+        cleaned = big[labels]
+
+        # 3. Connect nearby blobs
+        connected = self.connect_nearby_components(cleaned, radius=5)
+        return connected
+    
+    @staticmethod
+    def get_connected_components(mask):
+        labels = measure.label(mask, connectivity=2) 
+        regions = measure.regionprops(labels)
+        return regions
+
+
+    def create_mask_for_cell_pixel(self,cell_point):
+        shape = self.image.shape
+        mask = np.zeros(shape)
+        H,W = shape
+        bbox = (max(cell_point[0]-self.r,0),min(cell_point[0]+self.r,H),
+                max(cell_point[1]-self.r,0),min(cell_point[1]+self.r,W))
+        mask[bbox[0]:bbox[1],bbox[2]:bbox[3]] = 1
+        return mask.astype(bool)
+
+
+    @staticmethod
+    def create_region_mask(region,shape):
+        mask = np.zeros(shape)
+        cor = region.coords
+        mask[cor[:,0],cor[:,1]] = 1
+        return mask.astype(bool)
+
+    
+    def select_biggest_overlap(self,mask_cell_pixel,regions):
+        contained_region = None
+        n_pixels_contained = 0
+
+        for region in regions:
+            region_mask = self.create_region_mask(region,mask_cell_pixel.shape)
+            overlap = region_mask & mask_cell_pixel
+            if overlap.sum()>n_pixels_contained:
+                n_pixels_contained=overlap.sum()
+                contained_region = region_mask
+        return contained_region
+
+
+    @staticmethod
+    def fill_internal_holes(mask):
+        return ndimage.binary_fill_holes(mask)
+
+
+    def smooth_and_round(self,mask):
+        """
+        smooth_radius: small smoother edges, removed tiny bumps
+        round_radius:  large round corners, filled small concavities
+        necessary to make region more cell like
+        """
+        selem_smooth = disk(self.smooth_radius)
+        selem_round  = disk(self.round_radius)
+
+        # Remove tiny spikes / jaggies
+        removed_spikes_mask = opening(mask, selem_smooth)
+        # Round the object and fill small gaps
+        clean_mask = closing(removed_spikes_mask, selem_round)
+        return clean_mask
+
+
+
+    def SAM_found_cell_mask(self,cell_point):
         masks = self.segmentation_masks
-        if masks.shape[0]<=1:
-            print(f"Didn't found cellbody, image: {self.filename}")
+        if masks is not None or len(masks)!=0:
+            for mask in masks:
+                if not self.is_background(mask):
+                    if mask[cell_point[0],cell_point[1]]:
+                        return mask
+        print(f"SAM model didn't found cellbody, image: {self.filename}")
+
+
+    def create_classical_mask(self,cell_point):
+        #1. kmeans on sobel and grey image to detect foreground and background
+        img = self.image
+        sobel_img = sobel(img)
+        sobel_grey = np.stack((img[:,:],sobel_img[:,:]),axis=-1)
+        kmeans_clusters = self.kmeans(image=sobel_grey,k=2)
+        foreground = kmeans_clusters==0
+
+        #2. Prepare foreground
+        foreground = self.remove_small_and_fill(foreground)
+        regions = self.get_connected_components(foreground)
+        #3. Biggest overlap between quadrat around cell_pixel and region
+        mask_cell_pixel = self.create_mask_for_cell_pixel(cell_point)
+        best_region_mask = self.select_biggest_overlap(mask_cell_pixel,regions)
+
+        if best_region_mask is not None:
+            #4. prepare mask to make it more cell shaped and whole
+            best_region_mask = self.fill_internal_holes(best_region_mask)
+            best_region_mask = self.smooth_and_round(best_region_mask)
+            #pieces can be broken of while cleaning
+            connected_components_best_region = self.get_connected_components(best_region_mask)
+            biggest_region = max(connected_components_best_region, key=lambda x:x.area)
+            body_mask = self.create_region_mask(biggest_region,best_region_mask.shape)
+            return body_mask
+        
+        print(f"Classical method didn't found body either, image: {self.filename}")
+        return None
+
+
+
+    def find_cell_in_image(self,model,masks=None)->None:
+        if masks is None:
+            self.segment_image(model)
         else:
-            #select biggest mask for that is not whole image
-            mask_sums = masks.sum(axis=(1,2))
-            w,b = cv2.imread(self.file_path,cv2.IMREAD_GRAYSCALE).shape
-            thresholds_max_mask = mask_sums< (w*b*threshold_high) #nicht größer als 2/3
-            if not np.any(thresholds_max_mask):
-                print(f"Only found one big mask no cell, image: {self.filename}")
-            else:
-                idx = np.argmax(mask_sums * thresholds_max_mask)
-            if mask_sums[idx]<(threshold_low**2 * np.pi):
-                print(f"found mask to small beneath {threshold_low} pixels, image:{self.filename}")
-
-            #ensure the mask is not just an artefact by checking if it is a spheroid
-            ys,xs = np.where(masks[idx,:,:]==1)
-            height = ys.max() -ys.min()
-            width = xs.max() - xs.min()
-            area_elipse = int((height/2)*(width/2)*np.pi)
-            area_elipse *= tolerance_irregular_shape  #tolerance for irregular shapes
-            area_mask = masks[idx,:,:].sum()
-            if not area_mask < area_elipse:
-                #check spheroid to not match artefacts
-                print(f"found mask is not ellipsoide therefore no cell, image: {self.filename}")
-            else:
-                return masks[idx,:,:]
-
-
-    def find_cell_in_image(self,model,threshold_low:int=130,threshold_high:float=0.65,tolerance_irregular_shape:float=0.7)->None:
-        self.segment_image(model)
-        body_mask = self.which_is_cell_mask(threshold_low,threshold_high,tolerance_irregular_shape)
+            self.segmentation_masks=masks
+        
+        cell_point = self.find_point_in_cell_by_sobel()
+        body_mask = self.SAM_found_cell_mask(cell_point)
+        if body_mask is None:
+            body_mask = self.create_classical_mask(cell_point)
         if body_mask is not None:
             edges_mask,_,_ = self.detect_possible_arms()
-            cell_mask = self.fuse_cell_with_arms(cell_mask,edges_mask)
+            cell_mask = self.fuse_cell_with_arms(body_mask,edges_mask)
             arms_mask = self.remove_overlapping_arms(cell_mask,body_mask)
             self.cell = Cell(self.file_path,cell=cell_mask,body=body_mask,arms=arms_mask,edges=edges_mask)
 
     ###Plotting funcs###
     def plot_segmentation_masks(self,save_dir:Path)->None:
-        masks = self.segmentation_masks
-        n_masks = len(masks)
-        fig,axs = plt.subsplots(nrows=1,ncols=n_masks)
-        for ax,mask in zip(axs,masks):
-            ax.imshow(mask,"grey")
-        if save_dir is not None:
-            plt.savefig(save_dir/ f"segmentation_masks_{self.name}.png")
-        plt.show()
+        if self.segmentation_masks is not None:
+            masks = self.segmentation_masks
+            n_masks = len(masks)
+            if n_masks==1:
+                plt.imshow(masks[0],"grey")
+            else:
+                fig,axs = plt.subplots(nrows=1,ncols=n_masks)
+                for ax,mask in zip(axs,masks):
+                    ax.imshow(mask,"grey")
+                    ax.axis("off")
+            if save_dir is not None:
+                plt.savefig(save_dir/ f"{self.name}_segmentation_masks.png")
+            plt.show()
 
     
-    def plot_threshold_histogram(self,threshold,save_dir:Path=None):
-        mask, counts, bins = self.detect_possible_arms(threshold)
+    def plot_threshold_histogram(self,save_dir:Path=None):
+        mask, counts, bins = self.detect_possible_arms()
         fig, (ax1, ax2) = plt.subplots(1, 2)
         ax1.set_title("Distribution of edges deteted by sobel filter")
         ax1.bar(bins[:-1], counts, width=np.diff(bins), align='edge', color='gray', edgecolor='black')
+        threshold = sobel(self.image).mean()+ sobel(self.image).std() * self.sobel_arms_threshold
         ax1.vlines(threshold,ymin=0,ymax=counts.max(),color="r",label="threshold")
         ax1.legend()
-        ax2.imshow(self.img,cmap="gray")
-        ax2.imshow(self.mask, cmap='Reds', alpha=0.5)
+        ax2.imshow(self.image,cmap="gray")
+        ax2.imshow(mask, cmap='Reds', alpha=0.5)
         ax2.set_title("Mask of Edges")
         if save_dir is not None:
-            plt.savefig(save_dir / f"{self.name}_areas.png")
+            plt.savefig(save_dir / f"{self.name}_threshold.png")
         plt.show()
 
 
     def plot_cell_with_edges(self,save_dir:Path):
         if self.cell is not None:
-            self.cell.show_areas_with_detected_edges(self.name,save_dir)
+            self.cell.show_areas_with_detected_edges(self.image,self.name,save_dir)
 
 
     def plot_cell_areas(self,save_dir:Path):
         if self.cell is not None:
-            self.cell.show_different_cell_areas(self.name,save_dir)
+            self.cell.show_different_cell_areas(self.image,self.name,save_dir)
 
     
     def plot_preprocessing(self,save_dir:Path):
@@ -227,7 +417,7 @@ class ImageFibroblast:
         for ax in axs:
             ax.axis("off")
         if save_dir is not None:
-            plt.savefig(save_dir / f"{self.name}_processing.png")
+            plt.savefig(save_dir / f"{self.name}_preprocessing.png")
         plt.show()
 
     
@@ -295,8 +485,8 @@ class Cell:
             return 0
         
 
-    def show_different_cell_areas(self,name:str,save_dir:Path=None):
-        plt.imshow(cv2.imread(self.file_path), cmap='gray')
+    def show_different_cell_areas(self,img,name:str,save_dir:Path=None):
+        plt.imshow(img, cmap='gray')
         combined_mask = np.zeros_like(self.cell)
         if self.body is not None:
             combined_mask[self.body > 0] = 1
@@ -308,8 +498,8 @@ class Cell:
         plt.show()
 
 
-    def show_areas_with_detected_edges(self,name:str,save_dir:Path=None):
-        img = cv2.imread(self.file_path,cv2.IMREAD_GRAYSCALE)
+    def show_areas_with_detected_edges(self,img,name:str,save_dir:Path=None):
+        
         fig,ax = plt.subplots(1, 4,figsize=(12, 4))
         for axis in ax:
             axis.imshow(img,"grey")
@@ -321,7 +511,7 @@ class Cell:
         ax[1].set_title("Cell Body")
 
         ax[2].imshow(self.edges, cmap='jet', alpha=0.5)
-        ax[2].set_title(f"Edges (t:{self.threshold:.2f})")
+        ax[2].set_title(f"Edges")
 
         ax[3].imshow(self.cell, cmap='jet', alpha=0.5)
         ax[3].set_title("Final Cell")
